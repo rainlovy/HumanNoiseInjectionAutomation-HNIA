@@ -1,0 +1,694 @@
+# human_core.py
+import random
+import time
+from playwright.sync_api import Page
+
+class HumanCore:
+    def __init__(self, page: Page):
+        self.page = page
+    
+    def idle_short(self):
+        time.sleep(random.uniform(0.8, 2.5))
+    
+    def idle_medium(self):
+        time.sleep(random.uniform(3.0, 7.0))
+    
+    def idle_long(self):
+        time.sleep(random.uniform(8.0, 15.0))
+    
+    def idle_burst(self):
+        bursts = random.randint(2, 4)
+        for _ in range(bursts):
+            time.sleep(random.uniform(0.4, 1.2))
+    
+    def micro_movement(self):
+        try:
+            vp = self.page.viewport_size
+            if vp:
+                self.page.mouse.move(
+                    random.randint(-5, 5),
+                    random.randint(-3, 3),
+                    steps=random.randint(2, 4)
+                )
+        except:
+            pass
+    
+    def _human_scroll(self, amount: int):
+        direction = 1 if amount > 0 else -1
+        abs_amount = abs(amount)
+        
+        if abs_amount < 400:
+            steps = random.randint(1, 2)
+        else:
+            steps = random.randint(2, 4)
+        
+        remaining = abs_amount
+        for step in range(steps):
+            if step == steps - 1:
+                step_amt = remaining
+            else:
+                step_amt = random.randint(int(remaining * 0.3), int(remaining * 0.7))
+                remaining -= step_amt
+            
+            final = int(step_amt * random.uniform(0.9, 1.1)) * direction
+            scroll_steps = random.randint(1, 2)
+            
+            for _ in range(scroll_steps):
+                partial = final / scroll_steps
+                self.page.mouse.wheel(0, partial)
+                time.sleep(random.uniform(0.02, 0.06))
+            
+            if step < steps - 1:
+                pause = random.uniform(0.1, 0.3)
+                time.sleep(pause)
+                
+                if random.random() < 0.15:
+                    correction = -random.randint(5, 15) * direction
+                    self.page.mouse.wheel(0, correction)
+                    time.sleep(0.05)
+    
+    def scroll_down(self):
+        if random.random() < 0.7:
+            self._human_scroll(random.randint(200, 500))
+        else:
+            self._human_scroll(random.randint(500, 900))
+        time.sleep(random.uniform(0.3, 0.8))
+    
+    def scroll_up(self):
+        self._human_scroll(-random.randint(100, 300))
+        time.sleep(random.uniform(0.3, 0.8))
+    
+    def random_scroll(self):
+        if random.random() < 0.8:
+            self.scroll_down()
+        else:
+            self.scroll_up()
+    
+    def hesitation_pause(self):
+        time.sleep(random.uniform(0.5, 1.5))
+        self.micro_movement()
+
+# state_engine.py
+import time
+import random
+from enum import Enum, auto
+from typing import Optional, Callable, List
+from playwright.sync_api import Page, TimeoutError
+
+class State(Enum):
+    INIT = auto()
+    NAVIGATE = auto()
+    WAIT_READY = auto()
+    IDLE = auto()
+    ACTION = auto()
+    VERIFY = auto()
+    RECOVER = auto()
+    EXIT = auto()
+
+class StateEngine:
+    def __init__(self, page: Page, human_core, target_urls: List[str], task_callback: Callable[[Page], None]):
+        self.page = page
+        self.core = human_core
+        self.target_urls = target_urls
+        self.task_callback = task_callback
+        
+        self.state = State.INIT
+        self.state_start = time.time()
+        self.retry_count = 0
+        self.max_retries = 3
+        self.recovery_step = 0
+        self.max_recovery_steps = 4
+        self.session_start = time.time()
+        self.max_session_time = random.randint(600, 1800)
+        
+        self.heartbeat_last = time.time()
+        self.heartbeat_interval = 15
+        
+        self.action_timeout = 30
+        self.danger_selectors = [
+            "[href*='logout']",
+            "[href*='signout']",
+            "[href*='exit']",
+            "[aria-label*='log out']",
+            "[aria-label*='sign out']",
+            "button[type='submit'][value*='logout']"
+        ]
+        
+        self.state_sleep_map = {
+            State.INIT: (0.5, 1.5),
+            State.NAVIGATE: (2.0, 4.0),
+            State.WAIT_READY: (0.3, 0.7),
+            State.IDLE: (0.1, 0.3),
+            State.ACTION: (0.05, 0.15),
+            State.VERIFY: (1.0, 2.0),
+            State.RECOVER: (0.5, 1.0),
+            State.EXIT: (0, 0)
+        }
+    
+    def _check_heartbeat(self) -> bool:
+        if time.time() - self.heartbeat_last > self.heartbeat_interval:
+            try:
+                alive = self.page.evaluate("""
+                    () => {
+                        try {
+                            return document.readyState === 'complete';
+                        } catch {
+                            return false;
+                        }
+                    }
+                """)
+                self.heartbeat_last = time.time()
+                return alive
+            except:
+                return False
+        return True
+    
+    def _check_timeout(self) -> bool:
+        if time.time() - self.session_start > self.max_session_time:
+            return True
+        if time.time() - self.state_start > self.action_timeout:
+            return True
+        return False
+    
+    def _page_valid(self) -> bool:
+        try:
+            url = self.page.url
+            if not url or url == "about:blank" or "chrome-error://" in url:
+                return False
+            return True
+        except:
+            return False
+    
+    def _is_dangerous_element(self, element) -> bool:
+        try:
+            for selector in self.danger_selectors:
+                if element.locator(f"xpath=ancestor-or-self::{selector}").count() > 0:
+                    return True
+            
+            text = element.text_content().lower()
+            danger_phrases = ["log out", "sign out", "exit", "logout", "signout"]
+            if any(phrase in text for phrase in danger_phrases):
+                return True
+                
+            return False
+        except:
+            return True
+    
+    def _find_safe_clickable(self) -> bool:
+        selectors = [
+            "button:visible",
+            "a:visible",
+            "[role='button']:visible",
+            "[onclick]:visible",
+            "input[type='button']:visible",
+            "input[type='submit']:visible"
+        ]
+        
+        for selector in selectors:
+            try:
+                elements = self.page.locator(selector).all()
+                if not elements:
+                    continue
+                    
+                safe_elements = []
+                for elem in elements[:5]:
+                    try:
+                        if not elem.is_visible():
+                            continue
+                            
+                        if self._is_dangerous_element(elem):
+                            continue
+                            
+                        box = elem.bounding_box()
+                        if not box:
+                            continue
+                            
+                        if box['width'] < 10 or box['height'] < 10:
+                            continue
+                            
+                        if box['width'] * box['height'] < 100:
+                            continue
+                            
+                        safe_elements.append(elem)
+                    except:
+                        continue
+                
+                if safe_elements:
+                    elem = random.choice(safe_elements)
+                    self.core.hesitation_pause()
+                    elem.click(timeout=5000)
+                    time.sleep(random.uniform(0.5, 1.5))
+                    return True
+            except:
+                continue
+        return False
+    
+    def _execute_action(self):
+        if random.random() < 0.3:
+            self.task_callback(self.page)
+        else:
+            action_type = random.choices(
+                ["idle", "scroll", "click"],
+                weights=[50, 35, 15]
+            )[0]
+            
+            if action_type == "idle":
+                idle_type = random.choices(
+                    ["short", "medium", "long", "burst"],
+                    weights=[40, 30, 20, 10]
+                )[0]
+                
+                if idle_type == "short":
+                    self.core.idle_short()
+                elif idle_type == "medium":
+                    self.core.idle_medium()
+                elif idle_type == "long":
+                    self.core.idle_long()
+                else:
+                    self.core.idle_burst()
+            
+            elif action_type == "scroll":
+                self.core.random_scroll()
+            
+            elif action_type == "click":
+                if not self._find_safe_clickable():
+                    self.core.random_scroll()
+    
+    def _execute_recovery(self) -> bool:
+        self.recovery_step += 1
+        
+        if self.recovery_step > self.max_recovery_steps:
+            return False
+        
+        try:
+            if self.recovery_step == 1:
+                print("[RECOVER] Step 1: Wait and scroll")
+                time.sleep(random.uniform(5, 10))
+                self.core.scroll_down()
+                time.sleep(2)
+                return True
+            
+            elif self.recovery_step == 2:
+                print("[RECOVER] Step 2: Try go back")
+                try:
+                    self.page.go_back(timeout=10000)
+                    time.sleep(random.uniform(3, 5))
+                    return True
+                except:
+                    return True
+            
+            elif self.recovery_step == 3:
+                print("[RECOVER] Step 3: Soft reload")
+                try:
+                    self.page.reload(timeout=15000)
+                    time.sleep(random.uniform(3, 5))
+                    return True
+                except:
+                    return True
+            
+            elif self.recovery_step == 4:
+                print("[RECOVER] Step 4: Navigate to new URL")
+                try:
+                    new_url = random.choice(self.target_urls)
+                    self.page.goto(new_url, timeout=30000)
+                    time.sleep(random.uniform(3, 5))
+                    return True
+                except:
+                    return False
+        
+        except Exception:
+            return self.recovery_step < self.max_recovery_steps
+    
+    def _change_state(self, new_state: State):
+        self.state = new_state
+        self.state_start = time.time()
+        self.retry_count = 0
+        
+        if new_state == State.RECOVER:
+            self.recovery_step = 0
+        else:
+            self.recovery_step = 0
+    
+    def _get_state_sleep(self) -> float:
+        min_sleep, max_sleep = self.state_sleep_map.get(self.state, (0.1, 0.3))
+        return random.uniform(min_sleep, max_sleep)
+    
+    def run(self) -> bool:
+        while self.state != State.EXIT:
+            if self._check_timeout():
+                return True
+            
+            if not self._check_heartbeat():
+                self._change_state(State.RECOVER)
+                time.sleep(self._get_state_sleep())
+                continue
+            
+            if self.state == State.INIT:
+                self.core.idle_short()
+                self._change_state(State.NAVIGATE)
+            
+            elif self.state == State.NAVIGATE:
+                self.retry_count += 1
+                try:
+                    target_url = random.choice(self.target_urls)
+                    self.page.goto(target_url, timeout=30000)
+                    self._change_state(State.WAIT_READY)
+                except Exception:
+                    if self.retry_count >= self.max_retries:
+                        self._change_state(State.RECOVER)
+                    else:
+                        time.sleep(random.uniform(3, 6))
+            
+            elif self.state == State.WAIT_READY:
+                self.retry_count += 1
+                try:
+                    self.page.wait_for_load_state("load", timeout=15000)
+                    time.sleep(random.uniform(1, 3))
+                    
+                    ready = self.page.evaluate("""
+                        () => {
+                            try {
+                                return document.body && 
+                                       document.body.children.length > 2;
+                            } catch {
+                                return false;
+                            }
+                        }
+                    """)
+                    
+                    if ready:
+                        self._change_state(State.ACTION)
+                    else:
+                        if self.retry_count >= self.max_retries:
+                            self._change_state(State.RECOVER)
+                        else:
+                            time.sleep(random.uniform(2, 4))
+                except TimeoutError:
+                    if self.retry_count >= self.max_retries:
+                        self._change_state(State.RECOVER)
+                    else:
+                        self.core.scroll_down()
+                        time.sleep(2)
+            
+            elif self.state == State.ACTION:
+                try:
+                    if not self._page_valid():
+                        self._change_state(State.RECOVER)
+                        continue
+                    
+                    self._execute_action()
+                    self._change_state(State.VERIFY)
+                except Exception:
+                    self._change_state(State.RECOVER)
+            
+            elif self.state == State.VERIFY:
+                self.retry_count += 1
+                try:
+                    if self._page_valid():
+                        self._change_state(State.IDLE)
+                    else:
+                        if self.retry_count >= self.max_retries:
+                            self._change_state(State.RECOVER)
+                        else:
+                            time.sleep(random.uniform(1, 3))
+                except:
+                    self._change_state(State.RECOVER)
+            
+            elif self.state == State.IDLE:
+                self.core.idle_medium()
+                self._change_state(State.ACTION)
+            
+            elif self.state == State.RECOVER:
+                self.retry_count += 1
+                
+                if self.retry_count >= self.max_retries:
+                    return False
+                
+                recovery_success = self._execute_recovery()
+                
+                if recovery_success:
+                    self._change_state(State.WAIT_READY)
+                else:
+                    return False
+            
+            elif self.state == State.EXIT:
+                break
+            
+            time.sleep(self._get_state_sleep())
+        
+        return True
+
+# runner.py
+import time
+import random
+import signal
+import sys
+from typing import Optional, Callable, List
+from playwright.sync_api import sync_playwright, Browser, Page, BrowserContext
+from human_core import HumanCore
+from state_engine import StateEngine
+
+class SessionManager:
+    def __init__(self):
+        self.playwright = None
+        self.browser: Optional[Browser] = None
+        self.context: Optional[BrowserContext] = None
+        self.page: Optional[Page] = None
+        self.session_count = 0
+    
+    def create_session(self) -> Optional[Page]:
+        try:
+            if self.playwright is None:
+                self.playwright = sync_playwright().start()
+            
+            if self.browser:
+                self._cleanup()
+            
+            self.browser = self.playwright.chromium.launch(
+                headless=False,
+                args=[
+                    '--disable-blink-features=AutomationControlled',
+                    '--disable-dev-shm-usage',
+                    '--no-sandbox'
+                ]
+            )
+            
+            self.context = self.browser.new_context(
+                viewport={"width": 1280, "height": 800},
+                locale="en-US",
+                timezone_id="America/New_York"
+            )
+            
+            self.page = self.context.new_page()
+            self.page.set_default_timeout(30000)
+            self.session_count += 1
+            
+            return self.page
+        except Exception as e:
+            print(f"[MANAGER] Failed to create session: {e}")
+            self._cleanup()
+            return None
+    
+    def _cleanup(self):
+        try:
+            if self.page and not self.page.is_closed():
+                self.page.close()
+        except:
+            pass
+        try:
+            if self.context:
+                self.context.close()
+        except:
+            pass
+        try:
+            if self.browser:
+                self.browser.close()
+        except:
+            pass
+        
+        self.page = None
+        self.context = None
+        self.browser = None
+    
+    def shutdown(self):
+        self._cleanup()
+        if self.playwright:
+            self.playwright.stop()
+
+class ProductionRunner:
+    def __init__(self, target_urls: List[str], task_callback: Callable[[Page], None]):
+        self.target_urls = target_urls
+        self.task_callback = task_callback
+        self.manager = SessionManager()
+        self.running = False
+        self.max_runtime = 86400
+        self.max_sessions = 1000
+        self.session_cooldown = (10, 30)
+        self.failure_cooldown = (30, 60)
+        
+        signal.signal(signal.SIGINT, self._signal_handler)
+        signal.signal(signal.SIGTERM, self._signal_handler)
+    
+    def _signal_handler(self, signum, frame):
+        print(f"[RUNNER] Received signal {signum}, shutting down...")
+        self.running = False
+    
+    def _twitter_task(self, page: Page):
+        try:
+            time.sleep(random.uniform(1, 3))
+            
+            scroll_amt = random.randint(300, 700)
+            page.mouse.wheel(0, scroll_amt)
+            time.sleep(random.uniform(0.5, 1.5))
+            
+            tweet_selectors = ['article[data-testid="tweet"]', 'div[data-testid="tweet"]']
+            for selector in tweet_selectors:
+                tweets = page.locator(selector).all()
+                if tweets:
+                    tweet = random.choice(tweets[:3])
+                    if tweet.is_visible():
+                        like_btn = tweet.locator('[data-testid="like"]').first
+                        if like_btn.is_visible():
+                            like_btn.click()
+                            time.sleep(random.uniform(0.8, 1.5))
+                            break
+            
+            time.sleep(random.uniform(2, 4))
+        except:
+            pass
+    
+    def run_session(self) -> bool:
+        page = self.manager.create_session()
+        if not page:
+            print("[RUNNER] Failed to create page")
+            return False
+        
+        try:
+            core = HumanCore(page)
+            engine = StateEngine(
+                page=page,
+                human_core=core,
+                target_urls=self.target_urls,
+                task_callback=self.task_callback or self._twitter_task
+            )
+            return engine.run()
+        except Exception as e:
+            print(f"[RUNNER] Session error: {e}")
+            return False
+        finally:
+            try:
+                time.sleep(random.uniform(2, 4))
+            except:
+                pass
+    
+    def run(self):
+        self.running = True
+        start_time = time.time()
+        
+        try:
+            while (self.running and 
+                   time.time() - start_time < self.max_runtime and
+                   self.manager.session_count < self.max_sessions):
+                
+                print(f"[RUNNER] Session {self.manager.session_count + 1} starting")
+                
+                success = self.run_session()
+                
+                if success:
+                    print(f"[RUNNER] Session {self.manager.session_count} completed")
+                    cooldown = random.uniform(*self.session_cooldown)
+                else:
+                    print(f"[RUNNER] Session {self.manager.session_count} failed")
+                    cooldown = random.uniform(*self.failure_cooldown)
+                
+                if self.running:
+                    print(f"[RUNNER] Cooldown: {cooldown:.1f}s")
+                    
+                    elapsed = 0
+                    while elapsed < cooldown and self.running:
+                        time.sleep(1)
+                        elapsed += 1
+                        if elapsed % 10 == 0:
+                            print(f"[RUNNER] Waiting... {elapsed:.0f}s / {cooldown:.0f}s")
+                
+                if random.random() < 0.05:
+                    print("[RUNNER] Force cleanup cycle")
+                    self.manager._cleanup()
+                    time.sleep(random.uniform(5, 10))
+        
+        except Exception as e:
+            print(f"[RUNNER] Critical error: {e}")
+        finally:
+            self.stop()
+    
+    def stop(self):
+        self.running = False
+        self.manager.shutdown()
+        print("[RUNNER] Shutdown complete")
+
+def twitter_task_example(page: Page):
+    try:
+        time.sleep(random.uniform(1, 3))
+        
+        page.mouse.wheel(0, random.randint(200, 600))
+        time.sleep(random.uniform(0.5, 1.5))
+        
+        buttons = page.locator('button:visible').all()
+        if buttons:
+            btn = random.choice(buttons[:5])
+            btn.click()
+            time.sleep(random.uniform(0.8, 1.5))
+        
+        time.sleep(random.uniform(2, 4))
+    except:
+        pass
+
+if __name__ == "__main__":
+    TARGET_URLS = [
+        "https://twitter.com/home",
+        "https://twitter.com/explore",
+        "https://twitter.com/notifications"
+    ]
+    
+    runner = ProductionRunner(
+        target_urls=TARGET_URLS,
+        task_callback=twitter_task_example
+    )
+    
+    try:
+        runner.run()
+    except KeyboardInterrupt:
+        runner.stop()
+
+# config.py
+SESSION_MIN_SECONDS = 600
+SESSION_MAX_SECONDS = 1800
+MAX_RELOADS = 3
+MAX_RETRIES = 3
+HEARTBEAT_INTERVAL = 15
+ACTION_TIMEOUT = 30
+RECOVERY_COOLDOWN = 5
+MAX_RUNTIME_HOURS = 24
+MAX_SESSIONS = 1000
+SESSION_COOLDOWN = (10, 30)
+FAILURE_COOLDOWN = (30, 60)
+
+DANGER_SELECTORS = [
+    "[href*='logout']",
+    "[href*='signout']",
+    "[href*='exit']",
+    "[aria-label*='log out']",
+    "[aria-label*='sign out']",
+    "button[type='submit'][value*='logout']"
+]
+
+STATE_SLEEP_MAP = {
+    "INIT": (0.5, 1.5),
+    "NAVIGATE": (2.0, 4.0),
+    "WAIT_READY": (0.3, 0.7),
+    "IDLE": (0.1, 0.3),
+    "ACTION": (0.05, 0.15),
+    "VERIFY": (1.0, 2.0),
+    "RECOVER": (0.5, 1.0),
+    "EXIT": (0, 0)
+}
